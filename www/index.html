@@ -10,9 +10,12 @@ h1{font-size:20px;margin:0 0 4px}
 p.s{color:#9aa;font-size:13px;margin:0 0 14px}
 label{display:block;font-size:13px;margin:12px 0 4px;color:#bcd}
 select,input[type=file]{width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#1f2230;color:#fff;box-sizing:border-box}
-button{width:100%;margin-top:16px;padding:14px;border:0;border-radius:10px;background:#4f7cff;color:#fff;font-size:16px;font-weight:600}
-button:disabled{opacity:.5}
+button{width:100%;margin-top:12px;padding:14px;border:0;border-radius:10px;background:#4f7cff;color:#fff;font-size:16px;font-weight:600}
+button.dl{background:#2f9e6b}
+button:disabled{opacity:.45}
 progress{width:100%;height:14px}
+#pct{margin-top:14px;font-size:22px;font-weight:700}
+#sub{font-size:12px;color:#9aa;margin-bottom:4px}
 #log{margin-top:12px;font:12px/1.5 monospace;white-space:pre-wrap;background:#0d0f14;padding:10px;border-radius:8px;max-height:260px;overflow:auto}
 </style>
 </head>
@@ -29,11 +32,12 @@ progress{width:100%;height:14px}
 <label>Pilih file JSON (bisa banyak: Map001.json, Items.json, System.json, dst.)</label>
 <input type="file" id="files" multiple accept=".json,application/json">
 
-<button id="go">Mulai Terjemahkan</button>
-<div id="pct" style="margin-top:14px;font-size:22px;font-weight:700">0%</div>
-<div id="sub" style="font-size:12px;color:#9aa;margin-bottom:4px">Menunggu</div>
+<button id="go">1. Mulai Terjemahkan</button>
+<button id="dl" class="dl" disabled>2. Unduh Hasil (belum ada)</button>
+
+<div id="pct">0%</div>
+<div id="sub">Menunggu</div>
 <progress id="bar" value="0" max="100"></progress>
-<button id="retry" style="display:none;background:#2f9e6b">Simpan ulang yang gagal</button>
 <div id="log">Siap.</div>
 
 <script>
@@ -41,14 +45,29 @@ const $=id=>document.getElementById(id);
 const logEl=$('log');
 const lines=[];
 const log=m=>{lines.push(m);if(lines.length>40)lines.shift();logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
-const DS=window.Capacitor&&Capacitor.registerPlugin?Capacitor.registerPlugin('DownloadSaver'):null;
-const failed=[];
+const results=new Map(); // nama file -> teks JSON hasil terjemahan
+const FOLDER='rpgmtranslate';
 
 const CC=/\\[A-Za-z]+\[\d*\]|\\[.!|<>^{}$]|\\[A-Za-z]|%\d+/g;
 const DB=/^(Actors|Classes|Items|Weapons|Armors|Skills|States|Enemies)$/;
 const DBKEYS=new Set(['name','description','message1','message2','message3','message4','nickname','profile']);
 const cache=new Map();
 
+/* ---------- simpan ke Download/rpgmtranslate lewat plugin native ---------- */
+function callSave(opts){
+  const C=window.Capacitor;
+  if(!C)return Promise.reject(new Error('Capacitor tidak terdeteksi (bukan di dalam APK)'));
+  if(C.nativePromise)return C.nativePromise('DownloadSaver','save',opts);
+  if(C.Plugins&&C.Plugins.DownloadSaver)return C.Plugins.DownloadSaver.save(opts);
+  if(C.registerPlugin)return C.registerPlugin('DownloadSaver').save(opts);
+  return Promise.reject(new Error('jembatan Capacitor tidak punya nativePromise'));
+}
+async function save(name,text){
+  const r=await callSave({name,data:text,folder:FOLDER});
+  return (r&&r.path)||('Download/'+FOLDER+'/'+name);
+}
+
+/* ---------- penerjemahan ---------- */
 function protect(s){const m=[];const t=s.replace(CC,x=>{m.push(x);return '\u27e6'+(m.length-1)+'\u27e7'});return {t,m}}
 function restore(t,m){
   let n=0;
@@ -77,7 +96,6 @@ async function tr(s,sl,tl){
   cache.set(key,res);
   return res;
 }
-
 function collect(node,out,keys){
   if(Array.isArray(node)){node.forEach(n=>collect(n,out,keys));return}
   if(!node||typeof node!=='object')return;
@@ -111,36 +129,28 @@ async function pool(items,n,fn){
   let i=0;
   await Promise.all(Array.from({length:n},async()=>{while(i<items.length){const j=i++;await fn(items[j],j)}}));
 }
-async function save(name,text){
-  if(!DS)throw new Error('plugin simpan tidak ada');
-  const r=await DS.save({name,data:text,folder:'rpgmtranslate'});
-  return r.path;
-}
+
+/* ---------- tampilan ---------- */
 function setProgress(fi,total,frac,name){
   const p=(fi+frac)/total*100;
   $('bar').value=p;
   $('pct').textContent=p.toFixed(1)+'%';
   $('sub').textContent='File '+(fi+1)+' dari '+total+' · '+name+' ('+Math.round(frac*100)+'%)';
 }
-async function retryFailed(){
-  const list=failed.splice(0);
-  let ok=0;
-  for(const f of list){
-    try{await save(f.name,f.text);ok++}catch(e){failed.push(f)}
-  }
-  log('Simpan ulang: '+ok+' berhasil, '+failed.length+' masih gagal');
-  $('retry').style.display=failed.length?'block':'none';
+function refreshDl(){
+  const n=results.size;
+  $('dl').disabled=n===0;
+  $('dl').textContent=n?('2. Unduh Hasil ('+n+' file) → Download/'+FOLDER):'2. Unduh Hasil (belum ada)';
 }
-$('retry').onclick=retryFailed;
 
 $('go').onclick=async()=>{
   const files=[...$('files').files];
   if(!files.length){log('Pilih file JSON dulu.');return}
   const sl=$('sl').value,tl=$('tl').value;
-  $('go').disabled=true;
+  $('go').disabled=true;$('dl').disabled=true;
+  results.clear();
   try{if(navigator.wakeLock)await navigator.wakeLock.request('screen')}catch(e){}
-  failed.length=0;$('retry').style.display='none';
-  let okCount=0;
+  let bad=0;
   for(let fi=0;fi<files.length;fi++){
     const f=files[fi];
     const base=f.name.replace(/\.json$/i,'');
@@ -154,23 +164,38 @@ $('go').onclick=async()=>{
         done++;
         if(done%5===0||done===refs.length)setProgress(fi,files.length,done/refs.length,f.name);
       });
-      const text=JSON.stringify(data);
-      try{
-        await save(f.name,text);
-        okCount++;
-        log('OK  '+f.name+' ('+refs.length+' teks)');
-      }catch(e){
-        failed.push({name:f.name,text});
-        log('GAGAL simpan '+f.name+': '+e.message);
-      }
-    }catch(e){log('GAGAL '+f.name+': '+e.message)}
+      results.set(f.name,JSON.stringify(data));
+      log('OK  '+f.name+' ('+refs.length+' teks)');
+    }catch(e){bad++;log('GAGAL '+f.name+': '+e.message)}
   }
-  setProgress(files.length-1,files.length,1,'selesai');
-  $('pct').textContent='100%';
-  log('\nSelesai: '+okCount+'/'+files.length+' tersimpan di Download/rpgmtranslate');
-  if(failed.length)$('retry').style.display='block';
+  $('bar').value=100;$('pct').textContent='100%';
+  $('sub').textContent='Terjemahan selesai: '+results.size+' file siap'+(bad?(', '+bad+' gagal'):'');
+  log('\nSelesai. Tekan tombol hijau "Unduh Hasil".');
+  refreshDl();
   $('go').disabled=false;
 };
+
+$('dl').onclick=async()=>{
+  const names=[...results.keys()];
+  if(!names.length)return;
+  $('go').disabled=true;$('dl').disabled=true;
+  let ok=0,bad=0,lastErr='';
+  for(let i=0;i<names.length;i++){
+    const n=names[i];
+    $('bar').value=(i/names.length)*100;
+    $('pct').textContent=Math.round(i/names.length*100)+'%';
+    $('sub').textContent='Menyimpan '+(i+1)+' dari '+names.length+' · '+n;
+    try{await save(n,results.get(n));results.delete(n);ok++}
+    catch(e){bad++;lastErr=e.message||String(e);log('GAGAL simpan '+n+': '+lastErr)}
+  }
+  $('bar').value=100;$('pct').textContent='100%';
+  $('sub').textContent=ok+' file tersimpan di Download/'+FOLDER+(bad?(' · '+bad+' gagal'):'');
+  log('\n'+ok+' file tersimpan di Download/'+FOLDER+(bad?('\n'+bad+' gagal, tekan Unduh lagi. Error: '+lastErr):''));
+  refreshDl();
+  $('go').disabled=false;
+};
+
+log('Capacitor: '+(window.Capacitor?'ada':'TIDAK ADA')+' · jembatan native: '+((window.Capacitor&&window.Capacitor.nativePromise)?'ada':'tidak'));
 </script>
 </body>
 </html>
