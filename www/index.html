@@ -85,17 +85,69 @@ async function gt(text,sl,tl){
   }
   return null;
 }
-async function tr(s,sl,tl){
-  if(!/\p{L}/u.test(s.replace(CC,'')))return s;
-  const key=sl+tl+s;
-  if(cache.has(key))return cache.get(key);
-  const {t,m}=protect(s);
-  const out=await gt(t,sl,tl);
-  let res=s;
-  if(out){const r=restore(out,m);if(r!==null)res=r}
-  cache.set(key,res);
-  return res;
+
+let inflight=0;const waitQ=[];
+function limited(fn){
+  return new Promise((res,rej)=>{
+    const go=()=>{inflight++;fn().then(res,rej).finally(()=>{inflight--;if(waitQ.length)waitQ.shift()()})};
+    if(inflight<8)go();else waitQ.push(go);
+  });
 }
+let batchOK=true,batchFail=0;
+async function gtBatch(texts,sl,tl){
+  const body=new URLSearchParams();
+  texts.forEach(t=>body.append('q',t));
+  const url='https://translate.googleapis.com/translate_a/t?client=gtx&format=text&sl='+sl+'&tl='+tl;
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString()});
+  let d=await r.json();
+  if(typeof d==='string'&&texts.length===1)d=[d];
+  if(!Array.isArray(d)||d.length!==texts.length)return null;
+  const out=d.map(x=>Array.isArray(x)?x[0]:x);
+  return out.every(x=>typeof x==='string')?out:null;
+}
+async function translateBatch(items,sl,tl){
+  let outs=null;
+  if(batchOK){
+    try{outs=await limited(()=>gtBatch(items.map(i=>i.t),sl,tl))}catch(e){outs=null}
+    if(outs)batchFail=0;
+    else if(++batchFail>=3){batchOK=false;log('Mode cepat tidak didukung, pakai mode satuan')}
+  }
+  if(!outs)outs=await Promise.all(items.map(i=>limited(()=>gt(i.t,sl,tl))));
+  items.forEach((i,x)=>{
+    const o=outs[x];let res=i.s;
+    if(o){const r=restore(o,i.m);if(r!==null)res=r}
+    cache.set(sl+tl+i.s,res);
+  });
+}
+async function translateRefs(refs,sl,tl,onFrac){
+  const seen=new Set(),items=[];
+  for(const [o,k] of refs){
+    const s=o[k];
+    if(typeof s!=='string')continue;
+    const key=sl+tl+s;
+    if(cache.has(key)||seen.has(s))continue;
+    seen.add(s);
+    if(!/\p{L}/u.test(s.replace(CC,''))){cache.set(key,s);continue}
+    const {t,m}=protect(s);
+    items.push({s,t,m});
+  }
+  const batches=[];let cur=[],len=0;
+  for(const it of items){
+    if(cur.length&&(cur.length>=30||len+it.t.length>2500)){batches.push(cur);cur=[];len=0}
+    cur.push(it);len+=it.t.length;
+  }
+  if(cur.length)batches.push(cur);
+  let done=0;
+  onFrac(batches.length?0:1);
+  await Promise.all(batches.map(async b=>{await translateBatch(b,sl,tl);done++;onFrac(done/batches.length)}));
+  for(const [o,k] of refs){
+    const s=o[k];
+    if(typeof s!=='string')continue;
+    const r=cache.get(sl+tl+s);
+    if(r!==undefined)o[k]=r;
+  }
+}
+
 function collect(node,out,keys){
   if(Array.isArray(node)){node.forEach(n=>collect(n,out,keys));return}
   if(!node||typeof node!=='object')return;
@@ -150,26 +202,34 @@ $('go').onclick=async()=>{
   $('go').disabled=true;$('dl').disabled=true;
   results.clear();
   try{if(navigator.wakeLock)await navigator.wakeLock.request('screen')}catch(e){}
-  let bad=0;
-  for(let fi=0;fi<files.length;fi++){
+  const t0=Date.now();
+  const prog=new Array(files.length).fill(0);
+  let finished=0,bad=0;
+  const upd=()=>{
+    const p=prog.reduce((a,b)=>a+b,0)/files.length*100;
+    $('bar').value=p;
+    $('pct').textContent=p.toFixed(1)+'%';
+    const el=(Date.now()-t0)/1000;
+    let eta='';
+    if(p>1.5){const rem=el/p*(100-p);eta=' · sisa ±'+(rem>=90?Math.round(rem/60)+' mnt':Math.round(rem)+' dtk')}
+    $('sub').textContent=finished+' dari '+files.length+' file selesai'+eta+' · '+(batchOK?'mode cepat':'mode satuan');
+  };
+  upd();
+  await pool(files.map((_,i)=>i),3,async fi=>{
     const f=files[fi];
     const base=f.name.replace(/\.json$/i,'');
     try{
-      setProgress(fi,files.length,0,f.name);
       const data=JSON.parse(await f.text());
       const refs=gather(base,data);
-      let done=0;
-      await pool(refs,6,async([o,k])=>{
-        o[k]=await tr(o[k],sl,tl);
-        done++;
-        if(done%5===0||done===refs.length)setProgress(fi,files.length,done/refs.length,f.name);
-      });
+      await translateRefs(refs,sl,tl,fr=>{prog[fi]=fr*0.98;upd()});
       results.set(f.name,JSON.stringify(data));
       log('OK  '+f.name+' ('+refs.length+' teks)');
     }catch(e){bad++;log('GAGAL '+f.name+': '+e.message)}
-  }
+    prog[fi]=1;finished++;upd();
+  });
+  const mins=((Date.now()-t0)/60000).toFixed(1);
   $('bar').value=100;$('pct').textContent='100%';
-  $('sub').textContent='Terjemahan selesai: '+results.size+' file siap'+(bad?(', '+bad+' gagal'):'');
+  $('sub').textContent='Terjemahan selesai ('+mins+' menit): '+results.size+' file siap'+(bad?(', '+bad+' gagal'):'');
   log('\nSelesai. Tekan tombol hijau "Unduh Hasil".');
   refreshDl();
   $('go').disabled=false;
