@@ -12,7 +12,7 @@ label{display:block;font-size:13px;margin:12px 0 4px;color:#bcd}
 select,input[type=file]{width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#1f2230;color:#fff;box-sizing:border-box}
 button{width:100%;margin-top:16px;padding:14px;border:0;border-radius:10px;background:#4f7cff;color:#fff;font-size:16px;font-weight:600}
 button:disabled{opacity:.5}
-progress{width:100%;margin-top:14px;height:14px}
+progress{width:100%;height:14px}
 #log{margin-top:12px;font:12px/1.5 monospace;white-space:pre-wrap;background:#0d0f14;padding:10px;border-radius:8px;max-height:260px;overflow:auto}
 </style>
 </head>
@@ -30,14 +30,19 @@ progress{width:100%;margin-top:14px;height:14px}
 <input type="file" id="files" multiple accept=".json,application/json">
 
 <button id="go">Mulai Terjemahkan</button>
-<progress id="bar" value="0" max="1"></progress>
+<div id="pct" style="margin-top:14px;font-size:22px;font-weight:700">0%</div>
+<div id="sub" style="font-size:12px;color:#9aa;margin-bottom:4px">Menunggu</div>
+<progress id="bar" value="0" max="100"></progress>
+<button id="retry" style="display:none;background:#2f9e6b">Simpan ulang yang gagal</button>
 <div id="log">Siap.</div>
 
 <script>
 const $=id=>document.getElementById(id);
 const logEl=$('log');
-const log=m=>{logEl.textContent+='\n'+m;logEl.scrollTop=logEl.scrollHeight};
-const FS=window.Capacitor&&Capacitor.registerPlugin?Capacitor.registerPlugin('Filesystem'):null;
+const lines=[];
+const log=m=>{lines.push(m);if(lines.length>40)lines.shift();logEl.textContent=lines.join('\n');logEl.scrollTop=logEl.scrollHeight};
+const DS=window.Capacitor&&Capacitor.registerPlugin?Capacitor.registerPlugin('DownloadSaver'):null;
+const failed=[];
 
 const CC=/\\[A-Za-z]+\[\d*\]|\\[.!|<>^{}$]|\\[A-Za-z]|%\d+/g;
 const DB=/^(Actors|Classes|Items|Weapons|Armors|Skills|States|Enemies)$/;
@@ -107,39 +112,63 @@ async function pool(items,n,fn){
   await Promise.all(Array.from({length:n},async()=>{while(i<items.length){const j=i++;await fn(items[j],j)}}));
 }
 async function save(name,text){
-  try{
-    if(!FS)throw new Error('no fs');
-    await FS.writeFile({path:'RPGM-Translated/'+name,data:text,directory:'DOCUMENTS',encoding:'utf8',recursive:true});
-    return 'Documents/RPGM-Translated/'+name;
-  }catch(e){
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(new Blob([text],{type:'application/json'}));
-    a.download=name;a.click();
-    return 'unduhan: '+name;
-  }
+  if(!DS)throw new Error('plugin simpan tidak ada');
+  const r=await DS.save({name,data:text,folder:'rpgmtranslate'});
+  return r.path;
 }
+function setProgress(fi,total,frac,name){
+  const p=(fi+frac)/total*100;
+  $('bar').value=p;
+  $('pct').textContent=p.toFixed(1)+'%';
+  $('sub').textContent='File '+(fi+1)+' dari '+total+' · '+name+' ('+Math.round(frac*100)+'%)';
+}
+async function retryFailed(){
+  const list=failed.splice(0);
+  let ok=0;
+  for(const f of list){
+    try{await save(f.name,f.text);ok++}catch(e){failed.push(f)}
+  }
+  log('Simpan ulang: '+ok+' berhasil, '+failed.length+' masih gagal');
+  $('retry').style.display=failed.length?'block':'none';
+}
+$('retry').onclick=retryFailed;
 
 $('go').onclick=async()=>{
   const files=[...$('files').files];
   if(!files.length){log('Pilih file JSON dulu.');return}
   const sl=$('sl').value,tl=$('tl').value;
   $('go').disabled=true;
-  for(const f of files){
+  try{if(navigator.wakeLock)await navigator.wakeLock.request('screen')}catch(e){}
+  failed.length=0;$('retry').style.display='none';
+  let okCount=0;
+  for(let fi=0;fi<files.length;fi++){
+    const f=files[fi];
     const base=f.name.replace(/\.json$/i,'');
     try{
-      log('\n> '+f.name);
+      setProgress(fi,files.length,0,f.name);
       const data=JSON.parse(await f.text());
       const refs=gather(base,data);
-      log('  '+refs.length+' teks');
-      let done=0;$('bar').max=Math.max(refs.length,1);$('bar').value=0;
-      await pool(refs,4,async([o,k])=>{
+      let done=0;
+      await pool(refs,6,async([o,k])=>{
         o[k]=await tr(o[k],sl,tl);
-        $('bar').value=++done;
+        done++;
+        if(done%5===0||done===refs.length)setProgress(fi,files.length,done/refs.length,f.name);
       });
-      log('  disimpan: '+await save(f.name,JSON.stringify(data)));
-    }catch(e){log('  gagal: '+e.message)}
+      const text=JSON.stringify(data);
+      try{
+        await save(f.name,text);
+        okCount++;
+        log('OK  '+f.name+' ('+refs.length+' teks)');
+      }catch(e){
+        failed.push({name:f.name,text});
+        log('GAGAL simpan '+f.name+': '+e.message);
+      }
+    }catch(e){log('GAGAL '+f.name+': '+e.message)}
   }
-  log('\nSelesai. Salin file hasil ke folder data game (timpa yang asli, backup dulu).');
+  setProgress(files.length-1,files.length,1,'selesai');
+  $('pct').textContent='100%';
+  log('\nSelesai: '+okCount+'/'+files.length+' tersimpan di Download/rpgmtranslate');
+  if(failed.length)$('retry').style.display='block';
   $('go').disabled=false;
 };
 </script>
