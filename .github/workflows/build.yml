@@ -19,6 +19,27 @@ jobs:
       - run: npx cap add android
       - name: Pasang plugin simpan ke Download
         run: cp native/*.java android/app/src/main/java/com/nanak/rpgmtranslator/
+      - name: Pasang ikon
+        env:
+          GIT_TERMINAL_PROMPT: 0
+        run: |
+          sudo apt-get install -y imagemagick >/dev/null
+          SRC=""
+          [ -f icon.png ] && SRC=icon.png
+          if [ -z "$SRC" ]; then
+            git clone --depth 1 https://github.com/nanaksn1008-ux/Translate- /tmp/rp || true
+            SRC=$(find /tmp/rp -type f \( -iname 'icon*.png' -o -iname 'ic_launcher*.png' -o -iname 'logo*.png' \) -not -path '*/node_modules/*' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+          fi
+          echo "Ikon dipakai: $SRC"
+          if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+            R=android/app/src/main/res
+            rm -rf $R/mipmap-anydpi-v26
+            for p in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              d=${p%%:*}; s=${p##*:}
+              convert "$SRC" -resize ${s}x${s} $R/mipmap-$d/ic_launcher.png
+              cp $R/mipmap-$d/ic_launcher.png $R/mipmap-$d/ic_launcher_round.png
+            done
+          fi
       - run: npx cap sync android
       - run: cd android && chmod +x gradlew && ./gradlew assembleDebug
       - uses: actions/upload-artifact@v4
