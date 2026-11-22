@@ -74,34 +74,46 @@ function restore(t,m){
   const r=t.replace(/\u27e6\s*(\d+)\s*\u27e7/g,(a,i)=>{n++;return m[i]??''});
   return n===m.length?r:null;
 }
-async function gt(text,sl,tl){
-  const url='https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(text);
+const TMO=20000;
+let failCount=0,failStreak=0,maxInflight=10;const seenErr=new Set();
+function noteErr(e){
+  failCount++;failStreak++;
+  const m=String((e&&e.message)||e);
+  if(seenErr.size<4&&!seenErr.has(m)){seenErr.add(m);log('Error jaringan: '+m)}
+  if(failStreak>=6&&maxInflight>3){maxInflight=3;log('Server lambat/membatasi, kecepatan dikurangi')}
+}
+function getJSON(url){
+  let t;
+  const tm=new Promise((_,rej)=>{t=setTimeout(()=>rej(new Error('timeout')),TMO)});
+  const req=fetch(url).then(async r=>{
+    if(r.status&&r.status!==200)throw new Error('HTTP '+r.status);
+    return r.json();
+  });
+  return Promise.race([req,tm]).finally(()=>clearTimeout(t));
+}
+async function fetchRetry(url){
   for(let i=0;i<3;i++){
-    try{
-      const r=await fetch(url);
-      const d=await r.json();
-      return d[0].map(x=>x[0]).join('');
-    }catch(e){await new Promise(r=>setTimeout(r,800*(i+1)))}
+    try{const d=await getJSON(url);failStreak=0;return d}
+    catch(e){noteErr(e);await new Promise(r=>setTimeout(r,1000*(i+1)))}
   }
   return null;
 }
-
+async function gt(text,sl,tl){
+  const d=await fetchRetry('https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(text));
+  if(!d||!Array.isArray(d[0]))return null;
+  return d[0].map(x=>x[0]).join('');
+}
 let inflight=0;const waitQ=[];
 function limited(fn){
   return new Promise((res,rej)=>{
     const go=()=>{inflight++;fn().then(res,rej).finally(()=>{inflight--;if(waitQ.length)waitQ.shift()()})};
-    if(inflight<10)go();else waitQ.push(go);
+    if(inflight<maxInflight)go();else waitQ.push(go);
   });
 }
 let reqCount=0;
 async function gtLines(texts,sl,tl){
   reqCount++;
-  const url='https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(texts.join('\n'));
-  let d=null;
-  for(let i=0;i<3&&!d;i++){
-    try{const r=await fetch(url);d=await r.json()}
-    catch(e){await new Promise(r=>setTimeout(r,800*(i+1)))}
-  }
+  const d=await fetchRetry('https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(texts.join('\n')));
   if(!d||!Array.isArray(d[0]))return null;
   const parts=d[0].map(x=>x[0]).join('').split('\n');
   while(parts.length>texts.length&&parts[parts.length-1]==='')parts.pop();
@@ -141,7 +153,7 @@ async function translateRefs(refs,sl,tl,onFrac){
   const batches=[];let cur=[],len=0;
   for(const it of items){
     const el=encodeURIComponent(it.t).length+3;
-    if(cur.length&&(cur.length>=25||len+el>3500)){batches.push(cur);cur=[];len=0}
+    if(cur.length&&(cur.length>=15||len+el>2000)){batches.push(cur);cur=[];len=0}
     cur.push(it);len+=el;
   }
   if(cur.length)batches.push(cur);
@@ -220,7 +232,7 @@ $('go').onclick=async()=>{
     const el=(Date.now()-t0)/1000;
     let eta='';
     if(p>1.5){const rem=el/p*(100-p);eta=' · sisa ±'+(rem>=90?Math.round(rem/60)+' mnt':Math.round(rem)+' dtk')}
-    $('sub').textContent=finished+' dari '+files.length+' file selesai'+eta+' · mode kelompok · '+reqCount+' permintaan';
+    $('sub').textContent=finished+' dari '+files.length+' file selesai'+eta+' · '+reqCount+' permintaan'+(failCount?(' · '+failCount+' gagal/timeout'):'');
   };
   upd();
   await pool(files.map((_,i)=>i),3,async fi=>{
