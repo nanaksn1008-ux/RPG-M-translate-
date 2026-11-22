@@ -90,29 +90,36 @@ let inflight=0;const waitQ=[];
 function limited(fn){
   return new Promise((res,rej)=>{
     const go=()=>{inflight++;fn().then(res,rej).finally(()=>{inflight--;if(waitQ.length)waitQ.shift()()})};
-    if(inflight<8)go();else waitQ.push(go);
+    if(inflight<10)go();else waitQ.push(go);
   });
 }
-let batchOK=true,batchFail=0;
-async function gtBatch(texts,sl,tl){
-  const body=new URLSearchParams();
-  texts.forEach(t=>body.append('q',t));
-  const url='https://translate.googleapis.com/translate_a/t?client=gtx&format=text&sl='+sl+'&tl='+tl;
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString()});
-  let d=await r.json();
-  if(typeof d==='string'&&texts.length===1)d=[d];
-  if(!Array.isArray(d)||d.length!==texts.length)return null;
-  const out=d.map(x=>Array.isArray(x)?x[0]:x);
-  return out.every(x=>typeof x==='string')?out:null;
-}
-async function translateBatch(items,sl,tl){
-  let outs=null;
-  if(batchOK){
-    try{outs=await limited(()=>gtBatch(items.map(i=>i.t),sl,tl))}catch(e){outs=null}
-    if(outs)batchFail=0;
-    else if(++batchFail>=3){batchOK=false;log('Mode cepat tidak didukung, pakai mode satuan')}
+let reqCount=0;
+async function gtLines(texts,sl,tl){
+  reqCount++;
+  const url='https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(texts.join('\n'));
+  let d=null;
+  for(let i=0;i<3&&!d;i++){
+    try{const r=await fetch(url);d=await r.json()}
+    catch(e){await new Promise(r=>setTimeout(r,800*(i+1)))}
   }
-  if(!outs)outs=await Promise.all(items.map(i=>limited(()=>gt(i.t,sl,tl))));
+  if(!d||!Array.isArray(d[0]))return null;
+  const parts=d[0].map(x=>x[0]).join('').split('\n');
+  while(parts.length>texts.length&&parts[parts.length-1]==='')parts.pop();
+  return parts.length===texts.length?parts:null;
+}
+async function translateGroup(items,sl,tl){
+  let outs=null;
+  if(items.length>1){
+    try{outs=await limited(()=>gtLines(items.map(i=>i.t),sl,tl))}catch(e){outs=null}
+    if(!outs){
+      const h=items.length>>1;
+      await Promise.all([translateGroup(items.slice(0,h),sl,tl),translateGroup(items.slice(h),sl,tl)]);
+      return;
+    }
+  }else{
+    reqCount++;
+    outs=[await limited(()=>gt(items[0].t,sl,tl))];
+  }
   items.forEach((i,x)=>{
     const o=outs[x];let res=i.s;
     if(o){const r=restore(o,i.m);if(r!==null)res=r}
@@ -133,13 +140,14 @@ async function translateRefs(refs,sl,tl,onFrac){
   }
   const batches=[];let cur=[],len=0;
   for(const it of items){
-    if(cur.length&&(cur.length>=30||len+it.t.length>2500)){batches.push(cur);cur=[];len=0}
-    cur.push(it);len+=it.t.length;
+    const el=encodeURIComponent(it.t).length+3;
+    if(cur.length&&(cur.length>=25||len+el>3500)){batches.push(cur);cur=[];len=0}
+    cur.push(it);len+=el;
   }
   if(cur.length)batches.push(cur);
   let done=0;
   onFrac(batches.length?0:1);
-  await Promise.all(batches.map(async b=>{await translateBatch(b,sl,tl);done++;onFrac(done/batches.length)}));
+  await Promise.all(batches.map(async b=>{await translateGroup(b,sl,tl);done++;onFrac(done/batches.length)}));
   for(const [o,k] of refs){
     const s=o[k];
     if(typeof s!=='string')continue;
@@ -212,7 +220,7 @@ $('go').onclick=async()=>{
     const el=(Date.now()-t0)/1000;
     let eta='';
     if(p>1.5){const rem=el/p*(100-p);eta=' · sisa ±'+(rem>=90?Math.round(rem/60)+' mnt':Math.round(rem)+' dtk')}
-    $('sub').textContent=finished+' dari '+files.length+' file selesai'+eta+' · '+(batchOK?'mode cepat':'mode satuan');
+    $('sub').textContent=finished+' dari '+files.length+' file selesai'+eta+' · mode kelompok · '+reqCount+' permintaan';
   };
   upd();
   await pool(files.map((_,i)=>i),3,async fi=>{
