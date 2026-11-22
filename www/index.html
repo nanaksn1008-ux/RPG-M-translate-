@@ -29,6 +29,9 @@ progress{width:100%;height:14px}
 <label>Bahasa tujuan</label>
 <select id="tl"><option value="id">Indonesia</option><option value="en">Inggris</option></select>
 
+<label>Mesin terjemahan</label>
+<select id="eng"><option value="ms">Microsoft (cepat)</option><option value="g">Google (sering dibatasi)</option></select>
+
 <label>Pilih file JSON (bisa banyak: Map001.json, Items.json, System.json, dst.)</label>
 <input type="file" id="files" multiple accept=".json,application/json">
 
@@ -119,7 +122,82 @@ async function gtLines(texts,sl,tl){
   while(parts.length>texts.length&&parts[parts.length-1]==='')parts.pop();
   return parts.length===texts.length?parts:null;
 }
+let engine='ms';
+function escH(x){return x.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function unescH(x){return x.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&')}
+function protectHtml(s){
+  const m=[];let out='',last=0;
+  s.replace(CC,(x,idx)=>{out+=escH(s.slice(last,idx))+'<span class="notranslate">'+m.length+'</span>';m.push(x);last=idx+x.length;return x});
+  out+=escH(s.slice(last));
+  return {h:out,m};
+}
+function restoreHtml(t,m){
+  let n=0;
+  let r=t.replace(/<span[^>]*notranslate[^>]*>\s*(\d+)\s*<\/span>/gi,(a,i)=>{n++;return '\u0001'+i+'\u0002'});
+  if(n!==m.length)return null;
+  r=unescH(r.replace(/<[^>]+>/g,''));
+  return r.replace(/\u0001(\d+)\u0002/g,(a,i)=>m[i]);
+}
+async function nat(method,opts){
+  const C=window.Capacitor;
+  if(!C||!C.nativePromise)throw new Error('jembatan native tidak ada');
+  opts.connectTimeout=15000;opts.readTimeout=20000;
+  const r=await Promise.race([
+    C.nativePromise('CapacitorHttp',method,opts),
+    new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),TMO))
+  ]);
+  if(r&&r.status&&r.status>=400)throw new Error('HTTP '+r.status);
+  return r?r.data:null;
+}
+let msTok=null,msTokExp=0;
+async function msToken(){
+  if(msTok&&Date.now()<msTokExp)return msTok;
+  const d=await nat('get',{url:'https://edge.microsoft.com/translate/auth'});
+  const tok=String(d||'').trim();
+  if(tok.length<50)throw new Error('token Microsoft tidak valid');
+  msTok=tok;msTokExp=Date.now()+8*60*1000;
+  return tok;
+}
+const msLang=c=>({'zh-CN':'zh-Hans'}[c]||c);
+async function msBatch(htmls,sl,tl){
+  let lastE=null;
+  for(let i=0;i<3;i++){
+    try{
+      reqCount++;
+      const tok=await msToken();
+      const url='https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&textType=html&from='+(sl==='auto'?'':msLang(sl))+'&to='+msLang(tl);
+      let res=await nat('post',{url,headers:{'Authorization':'Bearer '+tok,'Content-Type':'application/json'},data:htmls.map(h=>({Text:h}))});
+      if(typeof res==='string'){try{res=JSON.parse(res)}catch(e){}}
+      if(!Array.isArray(res)||res.length!==htmls.length)throw new Error('balasan Microsoft tidak sesuai');
+      failStreak=0;
+      return res.map(x=>x&&x.translations&&x.translations[0]?x.translations[0].text:null);
+    }catch(e){
+      lastE=e;noteErr(e);
+      if(/401|403/.test(String(e.message)))msTok=null;
+      await new Promise(r=>setTimeout(r,1500*(i+1)));
+    }
+  }
+  throw lastE;
+}
 async function translateGroup(items,sl,tl){
+  if(engine==='ms'){
+    const hp=items.map(i=>protectHtml(i.s));
+    let outs=null;
+    try{outs=await limited(()=>msBatch(hp.map(x=>x.h),sl,tl))}catch(e){outs=null}
+    if(!outs){
+      if(items.length>1){
+        const h=items.length>>1;
+        await Promise.all([translateGroup(items.slice(0,h),sl,tl),translateGroup(items.slice(h),sl,tl)]);
+      }else cache.set(sl+tl+items[0].s,items[0].s);
+      return;
+    }
+    items.forEach((i,x)=>{
+      let res=i.s;
+      if(outs[x]){const r=restoreHtml(outs[x],hp[x].m);if(r!==null)res=r}
+      cache.set(sl+tl+i.s,res);
+    });
+    return;
+  }
   let outs=null;
   if(items.length>1){
     try{outs=await limited(()=>gtLines(items.map(i=>i.t),sl,tl))}catch(e){outs=null}
@@ -152,8 +230,9 @@ async function translateRefs(refs,sl,tl,onFrac){
   }
   const batches=[];let cur=[],len=0;
   for(const it of items){
-    const el=encodeURIComponent(it.t).length+3;
-    if(cur.length&&(cur.length>=15||len+el>2000)){batches.push(cur);cur=[];len=0}
+    const ms=engine==='ms';
+    const el=ms?it.s.length+40:encodeURIComponent(it.t).length+3;
+    if(cur.length&&(cur.length>=(ms?50:15)||len+el>(ms?4000:2000))){batches.push(cur);cur=[];len=0}
     cur.push(it);len+=el;
   }
   if(cur.length)batches.push(cur);
@@ -219,6 +298,7 @@ $('go').onclick=async()=>{
   const files=[...$('files').files];
   if(!files.length){log('Pilih file JSON dulu.');return}
   const sl=$('sl').value,tl=$('tl').value;
+  engine=$('eng').value;cache.clear();maxInflight=10;failStreak=0;
   $('go').disabled=true;$('dl').disabled=true;
   results.clear();
   try{if(navigator.wakeLock)await navigator.wakeLock.request('screen')}catch(e){}
